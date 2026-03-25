@@ -18,10 +18,59 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+
+
+def _get_glibc_version():
+    """Best-effort glibc version detection for kernel compatibility checks."""
+    try:
+        import ctypes
+        get_version = ctypes.CDLL("libc.so.6").gnu_get_libc_version
+        get_version.restype = ctypes.c_char_p
+        version_str = get_version().decode("utf-8")
+        major, minor = version_str.split(".")[:2]
+        return int(major), int(minor)
+    except Exception:
+        return None
+
+
+def _load_flash_attn_interface():
+    """
+    Try FA3 kernels first, then fall back to PyTorch SDPA if unavailable.
+    This catches runtime wheel incompatibilities (e.g. GLIBC_2.32 import errors).
+    """
+    forced_repo = os.environ.get("AUTORESEARCH_FA3_REPO", "").strip()
+    if forced_repo.lower() == "none":
+        print("Attention backend: torch_sdpa (forced by AUTORESEARCH_FA3_REPO=none)")
+        return None
+
+    glibc = _get_glibc_version()
+    cap = torch.cuda.get_device_capability()
+
+    if forced_repo:
+        repos = [forced_repo]
+    else:
+        repos = []
+        # varunneal's Hopper build can require newer glibc; skip it on older distros.
+        if cap == (9, 0) and (glibc is None or glibc >= (2, 32)):
+            repos.append("varunneal/flash-attention-3")
+        repos.append("kernels-community/flash-attn3")
+
+    load_errors = []
+    for repo in repos:
+        try:
+            interface = get_kernel(repo).flash_attn_interface
+            print(f"Attention backend: fa3 ({repo})")
+            return interface
+        except Exception as e:
+            load_errors.append((repo, repr(e)))
+
+    print("Attention backend: torch_sdpa (FA3 kernels unavailable)")
+    for repo, err in load_errors:
+        print(f"  failed {repo}: {err}")
+    return None
+
+
+fa3 = _load_flash_attn_interface()
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -58,6 +107,28 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
+def causal_attention(q, k, v, window_size):
+    """
+    Causal attention with FA3 if available, otherwise PyTorch SDPA fallback.
+    SDPA fallback ignores local-window pattern and uses full causal attention.
+    """
+    if fa3 is not None:
+        return fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+
+    # q/k/v: [B, T, H, D] -> SDPA expects [B, H, T, D]
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    # Handle grouped-query attention if n_kv_head < n_head.
+    if k.size(1) != q.size(1):
+        assert q.size(1) % k.size(1) == 0
+        repeats = q.size(1) // k.size(1)
+        k = k.repeat_interleave(repeats, dim=1)
+        v = v.repeat_interleave(repeats, dim=1)
+    y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=0.0)
+    return y.transpose(1, 2)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -90,7 +161,7 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        y = causal_attention(q, k, v, window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
