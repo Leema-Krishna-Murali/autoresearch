@@ -39,6 +39,24 @@ uv run train.py
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
 
+### Troubleshooting: `GLIBC_2.32 not found` on `uv run train.py`
+
+Some FlashAttention 3 kernel builds can require a newer glibc than your host provides. If you see an error like:
+
+```text
+ImportError: ... libc.so.6: version `GLIBC_2.32' not found ...
+```
+
+the training script now automatically falls back to a compatible attention backend when this happens.
+
+If you want to force the safe fallback manually, run:
+
+```bash
+AUTORESEARCH_FA3_REPO=none uv run train.py
+```
+
+This uses PyTorch SDPA attention instead of FA3 kernels (slower, but broadly compatible).
+
 ## Running the agent
 
 Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
